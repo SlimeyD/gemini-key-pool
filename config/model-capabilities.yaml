@@ -1,0 +1,378 @@
+# Model Capabilities - Gemini API Key Pool
+# Gemini models only — used for routing and thinking configuration
+# Last updated: 2026-03-19
+
+# Provider configuration
+providers:
+  gemini:
+    rotation_strategy: lru
+    env_prefix: "GEMINI_API_KEY"
+    base_url: "https://generativelanguage.googleapis.com"
+
+# Quality tier definitions
+quality_tiers:
+  draft:
+    description: "Quick iterations, brainstorming, throwaway content"
+    default_thinking: minimal
+    cost_priority: high
+
+  standard:
+    description: "Most everyday tasks, good enough for internal use"
+    default_thinking: medium
+    cost_priority: balanced
+
+  production:
+    description: "Final outputs, customer-facing, critical tasks"
+    default_thinking: high
+    cost_priority: quality
+
+  research:
+    description: "Strategic decisions, novel problems, deep analysis"
+    default_thinking: maximum
+    cost_priority: quality_first
+
+# Model specifications
+models:
+  # GEMINI 3.1 FAMILY (Latest)
+  gemini-3.1-flash:
+    full_name: "Gemini 3.1 Flash"
+    api_name: "gemini-3.1-flash-lite-preview"
+    provider: gemini
+    context_window: 1000000
+    output_limit: 65000
+    cost_tier: free
+    speed: very_fast
+    latency_ms: 150
+    thinking:
+      supported: true
+      type: thinking_level
+      levels: [minimal, low, medium, high]
+      default: high
+    quality_tiers:
+      draft:
+        thinking_level: minimal
+        suitable: true
+      standard:
+        thinking_level: medium
+        suitable: true
+      production:
+        thinking_level: high
+        suitable: true
+    best_for:
+      - keywords: [fast, volume, simple, chat, extract]
+        reason: "Highest price-performance ratio for high-volume tasks"
+    capabilities: [function_calling, code_execution, structured_output, json_mode, search_grounding]
+    rate_limits:
+      rpm: 15
+      tpm: 250000
+      rpd: 500
+    knowledge_cutoff: "2025-01"
+
+  gemini-3.1-flash-image:
+    full_name: "Gemini 3.1 Flash Image"
+    api_name: "gemini-3.1-flash-image-preview"
+    provider: gemini
+    context_window: 65000
+    output_limit: 32000
+    cost_tier: free
+    speed: very_fast
+    latency_ms: 800
+    thinking:
+      supported: true
+      type: thinking_level
+      levels: [minimal, high]
+      default: minimal
+    quality_tiers:
+      draft:
+        thinking_level: minimal
+        suitable: true
+      standard:
+        thinking_level: minimal
+        suitable: true
+      production:
+        thinking_level: high
+        suitable: true
+    best_for:
+      - keywords: [image, generate image, text in image, fast image, aspect ratio]
+        reason: "Image generation with advanced text rendering"
+    multimodal: true
+    input_types: [text, image]
+    output_types: [text, image]
+    capabilities: [image_generation, text_rendering, structured_output]
+    knowledge_cutoff: "2025-01"
+
+  gemini-3.1-pro:
+    full_name: "Gemini 3.1 Pro"
+    api_name: "gemini-3.1-pro-preview"
+    provider: gemini
+    context_window: 1000000
+    output_limit: 65000
+    cost_tier: free
+    speed: medium
+    latency_ms: 1000
+    thinking:
+      supported: true
+      type: thinking_level
+      levels: [low, high]
+      default: high
+    quality_tiers:
+      draft:
+        thinking_level: low
+        suitable: false
+      standard:
+        thinking_level: low
+        suitable: true
+      production:
+        thinking_level: high
+        suitable: true
+      research:
+        thinking_level: high
+        suitable: true
+    best_for:
+      - keywords: [agentic, autonomous, multi-step, complex tools]
+        reason: "Optimized for agentic workflows and reliable tool usage"
+      - keywords: [analyze, architect, design, complex]
+        reason: "Advanced reasoning for complex problem solving"
+    capabilities: [function_calling, code_execution, structured_output, json_mode, search_grounding, deep_reasoning]
+    rate_limits:
+      rpm: 10
+      tpm: 250000
+      rpd: 1000
+    knowledge_cutoff: "2025-01"
+
+  # GEMINI 3 FAMILY
+  gemini-3-flash:
+    full_name: "Gemini 3 Flash"
+    api_name: "gemini-3-flash-preview"
+    provider: gemini
+    context_window: 1000000
+    output_limit: 65000
+    cost_tier: free
+    speed: medium
+    latency_ms: 1000
+    thinking:
+      supported: true
+      type: thinking_level
+      levels: [low, high]
+      default: high
+    quality_tiers:
+      draft:
+        thinking_level: low
+        suitable: false
+      standard:
+        thinking_level: low
+        suitable: true
+      production:
+        thinking_level: high
+        suitable: true
+      research:
+        thinking_level: high
+        suitable: true
+    best_for:
+      - keywords: [analyze, architect, design, complex, review]
+        reason: "Deep reasoning with thinking mode"
+    capabilities: [function_calling, code_execution, structured_output, json_mode, search_grounding, deep_reasoning]
+    rate_limits:
+      rpm: 10
+      tpm: 250000
+      rpd: 1000
+    knowledge_cutoff: "2025-01"
+
+  gemini-3-pro-image-preview:
+    full_name: "Gemini 3 Pro Image"
+    api_name: "gemini-3-pro-image-preview"
+    provider: gemini
+    context_window: 65000
+    output_limit: 32000
+    cost_tier: free
+    speed: medium
+    latency_ms: 2000
+    thinking:
+      supported: true
+      type: thinking_level
+      levels: [low, high]
+      default: high
+    quality_tiers:
+      draft:
+        thinking_level: low
+        suitable: true
+      standard:
+        thinking_level: low
+        suitable: true
+      production:
+        thinking_level: high
+        suitable: true
+    best_for:
+      - keywords: [professional, brand, marketing, production, high-quality image]
+        reason: "High-fidelity image generation"
+    multimodal: true
+    input_types: [text, image]
+    output_types: [text, image]
+    capabilities: [image_generation, structured_output]
+    knowledge_cutoff: "2025-01"
+
+  # GEMINI 2.5 FAMILY (Stable Fallback)
+  gemini-2.5-flash:
+    full_name: "Gemini 2.5 Flash"
+    api_name: "gemini-2.5-flash"
+    provider: gemini
+    context_window: 1000000
+    output_limit: 65000
+    cost_tier: free
+    speed: very_fast
+    latency_ms: 200
+    thinking:
+      supported: true
+      type: thinking_budget
+      budget_range: [0, 24576]
+      default: -1  # dynamic
+    quality_tiers:
+      draft:
+        thinking_budget: 0
+        suitable: true
+      standard:
+        thinking_budget: 4096
+        suitable: true
+      production:
+        thinking_budget: 12000
+        suitable: true
+      research:
+        thinking_budget: 24576
+        suitable: false
+    best_for:
+      - keywords: [fallback, stable, reliable]
+        reason: "Stable production model when 3.x has issues"
+    capabilities: [function_calling, code_execution, structured_output, json_mode]
+    rate_limits:
+      rpm: 15
+      tpm: 250000
+      rpd: 1000
+    fallback_for: gemini-3-flash
+
+  gemini-2.5-pro:
+    full_name: "Gemini 2.5 Pro"
+    api_name: "gemini-2.5-pro"
+    provider: gemini
+    context_window: 1000000
+    output_limit: 65000
+    cost_tier: free
+    speed: medium
+    latency_ms: 1500
+    thinking:
+      supported: true
+      type: thinking_budget
+      budget_range: [128, 32768]
+      default: -1  # dynamic
+    quality_tiers:
+      draft:
+        thinking_budget: 1024
+        suitable: false
+      standard:
+        thinking_budget: 8000
+        suitable: true
+      production:
+        thinking_budget: 16000
+        suitable: true
+      research:
+        thinking_budget: 32768
+        suitable: true
+    best_for:
+      - keywords: [fallback, stable, reliable, complex]
+        reason: "Stable thinking model when 3.x has issues"
+    capabilities: [function_calling, code_execution, structured_output, json_mode, advanced_reasoning]
+    rate_limits:
+      rpm: 10
+      tpm: 250000
+      rpd: 1000
+    fallback_for: gemini-3-pro
+
+  gemini-2.5-flash-image:
+    full_name: "Gemini 2.5 Flash Image"
+    api_name: "gemini-2.5-flash-image"
+    provider: gemini
+    context_window: 65000
+    output_limit: 32000
+    cost_tier: free
+    speed: very_fast
+    latency_ms: 1000
+    thinking:
+      supported: false
+    quality_tiers:
+      draft:
+        suitable: true
+      standard:
+        suitable: true
+      production:
+        suitable: false
+    best_for:
+      - keywords: [quick image, fast image, prototype, draft image]
+        reason: "Fast image generation for high-volume tasks"
+    multimodal: true
+    input_types: [text, image]
+    output_types: [text, image]
+    capabilities: [image_generation, structured_output]
+
+  # GEMMA 3 FAMILY (Micro-tasks)
+  gemma-3-1b:
+    full_name: "Gemma 3 1B"
+    api_name: "gemma-3-1b"
+    provider: gemini
+    context_window: 128000
+    cost_tier: free
+    speed: extremely_fast
+    thinking:
+      supported: false
+    best_for:
+      - keywords: [micro-task, format, classify, simple extract]
+        reason: "Ultra-fast, high-volume micro-tasks"
+    rate_limits:
+      rpm: 30
+      rpd: 14400
+
+  # EMBEDDINGS
+  gemini-embedding-001:
+    full_name: "Gemini Embedding Model"
+    api_name: "gemini-embedding-001"
+    provider: gemini
+    input_limit: 2048
+    output_dimensions: [128, 256, 512, 768, 1536, 3072]
+    default_dimensions: 3072
+    cost_tier: free
+    speed: very_fast
+    latency_ms: 50
+    thinking:
+      supported: false
+    best_for:
+      - keywords: [embed, embedding, similarity, search, rag, vector]
+        reason: "Semantic similarity and retrieval"
+    capabilities: [semantic_similarity, classification, clustering, retrieval, rag]
+    rate_limits:
+      rpm: 1500
+
+# RATE LIMIT REFERENCE (free tier, March 2026)
+rate_limit_notes:
+  reset_time: "Midnight Pacific Time"
+  key_rotation_strategy: "LRU rotation across N project keys"
+  # Effective rates scale linearly with number of keys:
+  #   effective_rpm = model_rpm * num_keys
+  #   effective_rpd = model_rpd * num_keys
+  # Example with 18 keys:
+  #   gemini-3.1-flash: 15 RPM x 18 = 270 effective RPM, 500 RPD x 18 = 9000 effective RPD
+
+# ROUTING STRATEGY
+routing_strategy:
+  default_provider: gemini
+  default_model: gemini-3.1-flash
+
+  quality_routing:
+    draft: gemini-3.1-flash
+    standard: gemini-3-flash
+    production: gemini-3-flash
+    research: gemini-3-flash  # Use best available Flash on free tier
+
+  fallback_chain:
+    gemini-3.1-pro: gemini-3-flash
+    gemini-3.1-flash: gemini-3-flash
+    gemini-3.1-flash-image: gemini-2.5-flash-image
+    gemini-3-flash: gemini-2.5-flash
+    gemini-3-pro: gemini-2.5-pro

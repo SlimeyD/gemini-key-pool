@@ -1,0 +1,20 @@
+{
+  "providers": {
+    "gemini": {
+      "keys": [
+        {
+          "id": "project-1",
+          "api_key": "env:GEMINI_API_KEY_1"
+        },
+        {
+          "id": "project-2",
+          "api_key": "env:GEMINI_API_KEY_2"
+        },
+        {
+          "id": "project-3",
+          "api_key": "env:GEMINI_API_KEY_3"
+        }
+      ]
+    }
+  }
+}
