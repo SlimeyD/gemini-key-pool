@@ -9,9 +9,9 @@
 Google's Gemini Free Tier is powerful but strictly limited (e.g., 500 requests per day for 3.1 Flash Lite). To scale beyond this, you need multiple projects and keys. **Gemini Key Pool** automates the orchestration of these keys by providing:
 
 *   **Smart Key Rotation**: Uses Least-Recently-Used (LRU) selection to distribute load evenly across your pool.
-*   **Fail-Safe Rate Limiting**: Automatically detects `429 RESOURCE_EXHAUSTED` errors and puts individual keys on tiered cooldowns (RPM, TPM, RPD).
+*   **Fail-Safe Rate Limiting**: Automatically detects \`429 RESOURCE_EXHAUSTED\` errors and puts individual keys on tiered cooldowns (RPM, TPM, RPD).
 *   **Model Fallback**: If your best model (e.g., Flash 3.0) is completely exhausted across all keys, the system automatically falls back to a high-quota alternative (e.g., Flash 3.1 Lite).
-*   **Concurrency Safety**: Built for parallel execution. Atomic reservations (`reserve_key`) prevent multiple agents from "thundering herd" on the same key.
+*   **Concurrency Safety**: Built for parallel execution. Atomic reservations (\`reserve_key\`) prevent multiple agents from "thundering herd" on the same key.
 *   **Persistent Usage Tracking**: Remembers rate-limit states across restarts using a file-locked JSON database.
 
 ---
@@ -21,49 +21,54 @@ Google's Gemini Free Tier is powerful but strictly limited (e.g., 500 requests p
 ### 1. Prerequisites
 *   Python 3.10+
 *   Multiple Gemini API keys (create them at [Google AI Studio](https://aistudio.google.com/app/apikey))
-  *    Please note, limits apply per project - you can create up to 8 projects with their own gemini API keys which can be added with their own names to your .env file. 
+    *   Please note, limits apply per project - you can create up to 8 projects with their own Gemini API keys which can be added with their own names to your .env file.
 
 ### 2. Installation
-```bash
+\`\`\`bash
 git clone https://github.com/SlimeyD/gemini-key-pool.git
 cd gemini-key-pool
 pip install -r requirements.txt
-```
+\`\`\`
 
 ### 3. Configuration
 
-#### `keys.json`
-Define your keys in a `keys.json` file in the root directory. You can use literal keys or reference environment variables.
+Setting up the pool requires two files in your project root: \`.env\` for the secrets and \`keys.json\` to define the pool structure.
 
-```json
+#### Step 1: Create your \`.env\` file
+Create a file named \`.env\` and add your API keys. Using descriptive names helps you track which key belongs to which project.
+
+\`\`\`bash
+# .env
+GEMINI_KEY_PROJECT_1=AIzaSy...
+GEMINI_KEY_PROJECT_2=AIzaSy...
+GEMINI_KEY_PROJECT_3=AIzaSy...
+\`\`\`
+
+#### Step 2: Create your \`keys.json\` config
+Create a file named \`keys.json\` to define how the pool should use those keys. The \`api_key\` field should use the \`env:\` prefix followed by the variable name from your \`.env\`.
+
+\`\`\`json
 {
   "providers": {
     "gemini": {
       "keys": [
-        {"id": "account-1", "api_key": "env:GEMINI_KEY_1"},
-        {"id": "account-2", "api_key": "env:GEMINI_KEY_2"},
-        {"id": "account-3", "api_key": "AIzaSy...literal-key..."}
+        { "id": "primary-key", "api_key": "env:GEMINI_KEY_PROJECT_1" },
+        { "id": "secondary-key", "api_key": "env:GEMINI_KEY_PROJECT_2" },
+        { "id": "backup-key", "api_key": "env:GEMINI_KEY_PROJECT_3" }
       ]
     }
   }
 }
-```
-
-#### `.env` (Optional but Recommended)
-If you used `env:` in your `keys.json`, add your keys to a `.env` file:
-```bash
-GEMINI_KEY_1=AIzaSy...
-GEMINI_KEY_2=AIzaSy...
-```
+\`\`\`
 
 ---
 
 ## Usage
 
 ### As a CLI Tool
-The included `gemini_agent.py` is a powerful CLI for executing tasks:
+The included \`gemini_agent.py\` is a powerful CLI for executing tasks:
 
-```bash
+\`\`\`bash
 # Basic text generation
 python3 -m gemini_key_pool.gemini_agent --task "Summarize this log" --output result.md
 
@@ -72,12 +77,12 @@ python3 -m gemini_key_pool.gemini_agent --task "A blueprint of a spaceship" --im
 
 # High-quality research (uses Pro features via Flash if on free tier)
 python3 -m gemini_key_pool.gemini_agent --task "Analyze market trends" --quality research --enable-tools
-```
+\`\`\`
 
 ### As a Python Library
 Integrate the pool into your own applications:
 
-```python
+\`\`\`python
 from gemini_key_pool import KeyPoolManager, run_gemini_task
 
 # 1. Direct key management
@@ -99,7 +104,7 @@ result = run_gemini_task(
     quality_level="production"
 )
 print(result["output"])
-```
+\`\`\`
 
 ---
 
@@ -113,7 +118,7 @@ The system parses Google's error messages to determine exactly how long to block
 
 ### Model Fallback Chain
 When a model is requested, the system attempts to fulfill it using the best available key. If the pool is empty for that model, it falls back:
-`Gemini 3.1 Pro` → `Gemini 3 Flash` → `Gemini 2.5 Flash` → `Gemini 3.1 Flash Lite` → `Stop`
+\`Gemini 3.1 Pro\` → \`Gemini 3 Flash\` → \`Gemini 2.5 Flash\` → \`Gemini 3.1 Flash Lite\` → \`Stop\`
 
 ---
 
@@ -131,9 +136,9 @@ The system is pre-configured with the latest verified limits:
 
 ## Testing
 Run the suite of 42 tests to verify rotation, cooldowns, and locking logic:
-```bash
+\`\`\`bash
 pytest tests/ -v
-```
+\`\`\`
 
 ## License
 MIT
