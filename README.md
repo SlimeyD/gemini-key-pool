@@ -21,6 +21,7 @@ Google's Gemini Free Tier is powerful but strictly limited (e.g., 500 requests p
 ### 1. Prerequisites
 *   Python 3.10+
 *   Multiple Gemini API keys (create them at [Google AI Studio](https://aistudio.google.com/app/apikey))
+  *    Please note, limits apply per project - you can create up to 8 projects with their own gemini API keys which can be added with their own names to your .env file. 
 
 ### 2. Installation
 ```bash
