@@ -70,7 +70,7 @@ python3 -m gemini_key_pool.gemini_agent --task "Your prompt" --output result.md
 # With quality level (affects model selection and thinking depth)
 python3 -m gemini_key_pool.gemini_agent --task "Analyze this code" --quality production --context-file code.py --output analysis.md
 
-# Image generation
+# Image generation (uses gemini-2.5-flash-image)
 python3 -m gemini_key_pool.gemini_agent --task "A sunset over mountains" --image-output sunset.png
 
 # Image understanding
@@ -78,15 +78,12 @@ python3 -m gemini_key_pool.gemini_agent --task "Describe this image" --image-fil
 
 # With Google Search and code execution
 python3 -m gemini_key_pool.gemini_agent --task "What are the latest Gemini API changes?" --enable-tools --output research.md
-
-# Override model selection
-python3 -m gemini_key_pool.gemini_agent --task "Quick format this" --model gemini-3.1-flash --output formatted.md
 ```
 
 ### As a Python Library
 
 ```python
-from gemini_key_pool import KeyPoolManager, run_gemini_task, select_model_for_task
+from gemini_key_pool import KeyPoolManager, run_gemini_task
 
 # Direct API key management
 manager = KeyPoolManager()
@@ -102,19 +99,7 @@ finally:
 
 # On 429 error (per-model cooldown):
 manager.mark_key_rate_limited(key_id, error_message=str(error), model="gemini-3-flash")
-# Automatically detects RPM vs RPD vs quota and applies correct cooldown for that model
-
-# High-level task execution (handles rotation, fallback, everything)
-result = run_gemini_task(
-    task="Analyze this code for security issues",
-    quality_level="production",
-    output_file="/tmp/analysis.md"
-)
 ```
-
-### As a Claude Code Skill
-
-Copy `skill/SKILL.md` into your Claude Code skills directory. Set `GEMINI_KEY_POOL_ROOT` to point to this repo. The skill teaches Claude Code how to delegate work to Gemini agents.
 
 ## How It Works
 
@@ -163,14 +148,18 @@ pytest tests/ -v
 
 ## Free Tier Rate Limits (March 2026)
 
-| Model | RPM | RPD | With 3 Keys | With 18 Keys |
-|-------|-----|-----|-------------|--------------|
-| gemini-3.1-flash (Lite) | 15 | 500 | 45 RPM / 1,500 RPD | 270 RPM / 9,000 RPD |
-| gemini-3-flash | 10 | 1,000 | 30 RPM / 3,000 RPD | 180 RPM / 18,000 RPD |
-| gemini-2.5-flash | 15 | 1,000 | 45 RPM / 3,000 RPD | 270 RPM / 18,000 RPD |
-| gemini-2.5-pro | 10 | 0* | 30 RPM / 0 RPD | 180 RPM / 0 RPD |
+Verified from Google AI Studio dashboard (2026-03-24):
 
-*\*Pro models are restricted to pay-as-you-go or specific plan quotas as of 2026.*
+| Model | RPM | TPM | RPD | With 3 Keys | With 18 Keys |
+|-------|-----|-----|-----|-------------|--------------|
+| **Gemini 3.1 Flash Lite** | 15 | 250K | 500 | 45 RPM / 1,500 RPD | 270 RPM / 9,000 RPD |
+| **Gemini 3 Flash** | 5 | 250K | 20 | 15 RPM / 60 RPD | 90 RPM / 360 RPD |
+| **Gemini 2.5 Flash** | 5 | 250K | 20 | 15 RPM / 60 RPD | 90 RPM / 360 RPD |
+| **Gemini 2.5 Flash Lite** | 10 | 250K | 20 | 30 RPM / 60 RPD | 180 RPM / 360 RPD |
+| **Gemma 3 (1B/4B/12B/27B)** | 30 | 15K | 14.4K | 90 RPM / 43.2K RPD | 540 RPM / 259K RPD |
+| **Gemini 3.1 Pro** | 0* | 0* | 0* | 0 RPM / 0 RPD | 0 RPM / 0 RPD |
+
+*\*Pro models require a pay-as-you-go plan or billing upgrade in 2026.*
 
 ## License
 
