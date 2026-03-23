@@ -2,12 +2,13 @@
 
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
-# Ensure src/ is on the import path
+# Adjust path for gemini-key-pool package structure
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from gemini_key_pool.key_pool_manager import KeyPoolManager, parse_rate_limit_type, COOLDOWN_TIERS
@@ -78,7 +79,7 @@ class TestLRUSelection:
             },
         }
         selected = pool_manager.select_key("gemini")
-        assert selected == "key-b"  # oldest timestamp -> selected first
+        assert selected == "key-b"  # oldest timestamp → selected first
 
     def test_never_used_key_selected_first(self, pool_manager):
         """A key with no usage history should be preferred over used keys."""
@@ -91,7 +92,7 @@ class TestLRUSelection:
                 "total_requests": 1,
                 "history": [{"timestamp": 6000, "usage": {"requests": 1}}],
             },
-            # key-b has no entry -> never used
+            # key-b has no entry → never used
         }
         selected = pool_manager.select_key("gemini")
         assert selected == "key-b"
@@ -125,7 +126,7 @@ class TestCooldownNearest:
 
     def test_cooldown_not_used_when_keys_available(self, pool_manager):
         """If at least one key is off cooldown, cooldown logic should not
-        be triggered - the available key is selected normally."""
+        be triggered — the available key is selected normally."""
         now = time.time()
         pool_manager.usage = {
             "key-a": {
@@ -138,7 +139,7 @@ class TestCooldownNearest:
                 "history": [{"timestamp": 2000, "usage": {"requests": 1}}],
                 "rate_limit_backoff": now + 600,
             },
-            # key-b: no cooldown, no history -> available and never used
+            # key-b: no cooldown, no history → available and never used
         }
         selected = pool_manager.select_key("gemini")
         assert selected == "key-b"
@@ -280,3 +281,118 @@ class TestClearExpiredCooldowns:
             },
         }
         assert pool_manager.clear_expired_cooldowns() == 0
+
+    def test_clears_expired_model_cooldowns(self, pool_manager):
+        pool_manager.usage = {
+            "key-a": {
+                "total_requests": 1,
+                "history": [],
+                "model_cooldowns": {
+                    "gemini-3-flash": time.time() - 10,   # expired
+                    "gemini-2.5-flash": time.time() + 300,  # still active
+                },
+            },
+        }
+        cleared = pool_manager.clear_expired_cooldowns()
+        assert cleared == 1
+        assert "gemini-3-flash" not in pool_manager.usage["key-a"]["model_cooldowns"]
+        assert "gemini-2.5-flash" in pool_manager.usage["key-a"]["model_cooldowns"]
+
+
+class TestKeyReservation:
+    def test_reserved_key_not_selected_again(self, pool_manager):
+        """A reserved key should not be returned by select_key until released."""
+        key1 = pool_manager.reserve_key("gemini")
+        key2 = pool_manager.reserve_key("gemini")
+        assert key1 != key2, "Two consecutive reserves must return different keys"
+
+    def test_released_key_becomes_available(self, pool_manager):
+        """After release, a key can be reserved again."""
+        key1 = pool_manager.reserve_key("gemini")
+        pool_manager.release_key(key1)
+        # After release, all 3 keys are available again — we can do 3 more reserves
+        keys = [pool_manager.reserve_key("gemini") for _ in range(3)]
+        assert key1 in keys  # key1 is available again
+
+    def test_all_keys_reserved_raises(self, pool_manager):
+        """When all keys are reserved, reserve_key should raise RuntimeError."""
+        pool_manager.reserve_key("gemini")  # key-a
+        pool_manager.reserve_key("gemini")  # key-b
+        pool_manager.reserve_key("gemini")  # key-c
+        with pytest.raises(RuntimeError, match="No available keys"):
+            pool_manager.reserve_key("gemini")
+
+    def test_unknown_provider_raises_value_error(self, pool_manager):
+        with pytest.raises(ValueError, match="not found"):
+            pool_manager.reserve_key("nonexistent")
+
+    def test_count_available_unknown_provider_raises(self, pool_manager):
+        with pytest.raises(ValueError, match="not found"):
+            pool_manager.count_available("nonexistent")
+
+
+class TestCountAvailable:
+    def test_all_keys_available_initially(self, pool_manager):
+        assert pool_manager.count_available("gemini") == 3
+
+    def test_reserved_key_not_counted(self, pool_manager):
+        pool_manager.reserve_key("gemini")
+        assert pool_manager.count_available("gemini") == 2
+
+    def test_cooldown_key_not_counted(self, pool_manager):
+        pool_manager.mark_key_rate_limited("key-a", cooldown_seconds=300)
+        assert pool_manager.count_available("gemini") == 2
+
+
+class TestPerModelCooldown:
+    def test_model_specific_cooldown_does_not_block_other_models(self, pool_manager):
+        """A key rate-limited on flash should still be available for lite."""
+        pool_manager.mark_key_rate_limited("key-a", cooldown_seconds=300,
+                                           model="gemini-3-flash")
+        assert pool_manager.is_key_available("key-a", model="gemini-2.5-flash") is True
+
+    def test_model_specific_cooldown_blocks_same_model(self, pool_manager):
+        pool_manager.mark_key_rate_limited("key-a", cooldown_seconds=300,
+                                           model="gemini-3-flash")
+        assert pool_manager.is_key_available("key-a", model="gemini-3-flash") is False
+
+    def test_global_cooldown_blocks_all_models(self, pool_manager):
+        """Cooldown with no model specified (legacy) blocks all models."""
+        pool_manager.mark_key_rate_limited("key-a", cooldown_seconds=300)
+        assert pool_manager.is_key_available("key-a", model="gemini-3-flash") is False
+        assert pool_manager.is_key_available("key-a", model="gemini-2.5-flash") is False
+
+    def test_no_cooldown_key_is_available_for_any_model(self, pool_manager):
+        assert pool_manager.is_key_available("key-a", model="gemini-3-flash") is True
+        assert pool_manager.is_key_available("key-a") is True
+
+
+class TestFileLocking:
+    def test_concurrent_writes_do_not_lose_data(self, pool_manager, tmp_path):
+        """Two threads writing cooldowns simultaneously must not overwrite each other."""
+        usage_path = str(tmp_path / "key-usage.json")
+        pool_manager.usage_path = usage_path
+        pool_manager.usage = {}
+
+        errors = []
+
+        def mark_and_check(key_id):
+            try:
+                pool_manager.mark_key_rate_limited(key_id, cooldown_seconds=300)
+            except Exception as e:
+                errors.append(str(e))
+
+        t1 = threading.Thread(target=mark_and_check, args=("key-a",))
+        t2 = threading.Thread(target=mark_and_check, args=("key-b",))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        # Reload from disk — both keys must be present
+        import json
+        with open(usage_path) as f:
+            data = json.load(f)
+        assert errors == [], f"Errors during concurrent writes: {errors}"
+        assert "key-a" in data
+        assert "key-b" in data
+        assert data["key-a"].get("rate_limit_backoff", 0) > 0
+        assert data["key-b"].get("rate_limit_backoff", 0) > 0

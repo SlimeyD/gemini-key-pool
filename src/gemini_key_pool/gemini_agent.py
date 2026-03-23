@@ -25,8 +25,14 @@ from pathlib import Path
 from datetime import datetime
 
 # Add package directory for local imports
-script_dir = Path(__file__).parent
-sys.path.insert(0, str(script_dir))
+try:
+    from .key_pool_manager import KeyPoolManager, parse_rate_limit_type, COOLDOWN_TIERS
+    from .model_router import select_model_for_task
+    from .paths import get_logs_dir
+except ImportError:
+    from key_pool_manager import KeyPoolManager, parse_rate_limit_type, COOLDOWN_TIERS
+    from model_router import select_model_for_task
+    from paths import get_logs_dir
 
 try:
     from dotenv import load_dotenv
@@ -35,26 +41,23 @@ try:
     from google.genai import errors as genai_errors
     import yaml
 except ImportError as e:
-    print(f"Missing dependency: {e}")
+    print(f"❌ Missing dependency: {e}")
     print("Run: pip install google-genai python-dotenv pyyaml")
     sys.exit(1)
 
-try:
-    from .key_pool_manager import KeyPoolManager, parse_rate_limit_type, COOLDOWN_TIERS
-    from .model_router import select_model_for_task
-    from .paths import get_logs_dir, get_root
-except ImportError:
-    from key_pool_manager import KeyPoolManager, parse_rate_limit_type, COOLDOWN_TIERS
-    from model_router import select_model_for_task
-    from paths import get_logs_dir, get_root
-
-# Circuit breaker: stop burning keys after this many consecutive 429s
-CIRCUIT_BREAKER_THRESHOLD = 3
+# Circuit breaker thresholds — separate for time-based vs daily limits.
+# RPM/TPM: per-minute limits reset on rolling window — try fewer keys, then wait.
+# RPD/quota: daily limits are key-specific — try more keys before falling back to next model.
+CIRCUIT_BREAKER_THRESHOLD_RPM = 3   # Per-minute: try 3 keys then wait 90s
+CIRCUIT_BREAKER_THRESHOLD_RPD = 9   # Per-day: try half the pool before model fallback
+CIRCUIT_BREAKER_THRESHOLD = CIRCUIT_BREAKER_THRESHOLD_RPM  # backward compat alias
 # Seconds to wait between key retries (with jitter) to avoid thundering herd
 KEY_RETRY_DELAY_BASE = 1.0
-KEY_RETRY_DELAY_JITTER = 1.0  # random 0-1s added
+KEY_RETRY_DELAY_JITTER = 1.0  # random 0–1s added
+# Models that don't support generateContent (e.g. embedding-only models)
+NON_GENERATIVE_MODELS = {"gemini-embedding-001"}
 
-# Execution logging - uses location-aware path resolution
+# Execution logging - uses package-aware path resolution
 LOG_DIR = get_logs_dir()
 EXECUTION_LOG = LOG_DIR / "executions.jsonl"
 
@@ -65,14 +68,22 @@ def _ensure_env():
     global _env_loaded
     if _env_loaded:
         return
-    env_paths = [
-        get_root() / ".env",
-        Path(os.path.expanduser("~/.env")),
-    ]
-    for env_path in env_paths:
+    # Use paths.get_env_file if available, otherwise fallback
+    try:
+        from .paths import get_env_file
+        env_path = get_env_file()
         if env_path.exists():
             load_dotenv(env_path)
-            break
+    except ImportError:
+        env_paths = [
+            Path(__file__).parent.parent.parent / ".env",
+            Path(os.path.expanduser("~/.env")),
+            Path(os.path.expanduser("~/SecondBrain/.env")),
+        ]
+        for env_path in env_paths:
+            if env_path.exists():
+                load_dotenv(env_path)
+                break
     _env_loaded = True
 
 
@@ -93,7 +104,6 @@ def log_execution(task_summary: str, result: dict, task_type: str = "text",
             "quality_level": quality_level,
             "thinking_config": result.get("thinking_config"),
             "tools_used": result.get("tools_used", []),
-            "system_prompt_used": result.get("system_prompt_used", False),
             "tokens_in": result.get("tokens_in"),
             "tokens_out": result.get("tokens_out"),
             "duration_ms": result.get("duration_ms"),
@@ -110,138 +120,12 @@ def log_execution(task_summary: str, result: dict, task_type: str = "text",
             f.write(json.dumps(log_entry) + "\n")
 
     except Exception as e:
-        print(f"Warning: Failed to log execution: {e}")
+        print(f"⚠️  Failed to log execution: {e}")
 
 
-def parse_context_template(template_path: str) -> dict:
-    """
-    Parse a YAML context template and extract all relevant information.
-
-    Returns a dict with:
-        - task: str (task description)
-        - quality_level: str
-        - model: str (if specified in routing)
-        - thinking_config: dict (if specified)
-        - tools_enabled: list
-        - system_prompt: str (built from context)
-        - context_content: str (built from files, decisions, etc.)
-        - enable_tools: bool
-    """
-    with open(template_path, 'r') as f:
-        ctx = yaml.safe_load(f)
-
-    result = {
-        "task": ctx.get("task", {}).get("description", ""),
-        "quality_level": ctx.get("task", {}).get("quality_level", ""),
-        "model": ctx.get("routing", {}).get("model", ""),
-        "api_name": ctx.get("routing", {}).get("api_name", ""),
-        "thinking_config": ctx.get("routing", {}).get("thinking_config", {}),
-        "tools_enabled": ctx.get("routing", {}).get("tools_enabled", []),
-        "enable_tools": bool(ctx.get("routing", {}).get("tools_enabled", [])),
-    }
-
-    # Build system prompt from quality level and task type
-    task_type = ctx.get("task", {}).get("type", "")
-    quality_level = result["quality_level"]
-
-    system_parts = []
-    if task_type:
-        system_parts.append(f"You are performing a {task_type.replace('_', ' ')} task.")
-    if quality_level:
-        quality_guidance = {
-            "draft": "Provide a quick, working response. Prioritize speed over perfection.",
-            "standard": "Provide a thorough, well-reasoned response suitable for internal use.",
-            "production": "Provide a polished, high-quality response suitable for customer-facing use. Consider edge cases.",
-            "research": "Provide deep analysis with careful reasoning. Consider multiple perspectives and trade-offs."
-        }
-        system_parts.append(quality_guidance.get(quality_level, ""))
-
-    # Add quality requirements
-    requirements = ctx.get("quality", {}).get("specific_requirements", [])
-    if requirements:
-        system_parts.append("Requirements:")
-        for req in requirements:
-            system_parts.append(f"- {req}")
-
-    # Add anti-patterns
-    anti_patterns = ctx.get("quality", {}).get("anti_patterns", [])
-    if anti_patterns:
-        system_parts.append("Avoid:")
-        for ap in anti_patterns:
-            system_parts.append(f"- {ap}")
-
-    result["system_prompt"] = "\n".join(system_parts)
-
-    # Build context content from various sources
-    context_parts = []
-
-    # Add session decisions
-    decisions = ctx.get("session", {}).get("decisions", [])
-    if decisions:
-        context_parts.append("## Previous Decisions\n")
-        for d in decisions:
-            context_parts.append(f"- **{d.get('decision', '')}**: {d.get('rationale', '')}")
-        context_parts.append("")
-
-    # Add constraints
-    constraints = ctx.get("session", {}).get("constraints", [])
-    if constraints:
-        context_parts.append("## Constraints\n")
-        for c in constraints:
-            context_parts.append(f"- **{c.get('constraint', '')}**: {c.get('reason', '')}")
-        context_parts.append("")
-
-    # Add assumptions
-    assumptions = ctx.get("session", {}).get("assumptions", [])
-    if assumptions:
-        context_parts.append("## Assumptions\n")
-        for a in assumptions:
-            validated = "Y" if a.get("validated", False) else "?"
-            context_parts.append(f"- [{validated}] {a.get('assumption', '')}")
-        context_parts.append("")
-
-    # Add file contents (read primary files)
-    primary_files = ctx.get("files", {}).get("primary", [])
-    for f in primary_files:
-        file_path = f.get("path", "")
-        if file_path and os.path.exists(file_path) and f.get("read_full", True):
-            context_parts.append(f"## File: {file_path}\n")
-            if f.get("relevance"):
-                context_parts.append(f"*Relevance: {f.get('relevance')}*\n")
-            try:
-                with open(file_path, 'r') as fp:
-                    content = fp.read()
-                ext = Path(file_path).suffix.lstrip('.')
-                lang_map = {'rb': 'ruby', 'py': 'python', 'js': 'javascript', 'ts': 'typescript'}
-                lang = lang_map.get(ext, ext)
-                context_parts.append(f"```{lang}\n{content}\n```\n")
-            except Exception as e:
-                context_parts.append(f"*Could not read file: {e}*\n")
-
-    # Add code snippets
-    code_context = ctx.get("code_context", [])
-    for snippet in code_context:
-        desc = snippet.get("description", "Code snippet")
-        lang = snippet.get("language", "")
-        content = snippet.get("content", "")
-        context_parts.append(f"## {desc}\n")
-        context_parts.append(f"```{lang}\n{content}\n```\n")
-
-    # Add documentation links
-    docs = ctx.get("documentation", [])
-    if docs:
-        context_parts.append("## Documentation References\n")
-        for doc in docs:
-            context_parts.append(f"- [{doc.get('description', doc.get('url', ''))}]({doc.get('url', '')})")
-        context_parts.append("")
-
-    result["context_content"] = "\n".join(context_parts)
-
-    return result
-
-
-# Model name mappings (router names -> API names)
+# Model name mappings (router names → API names)
 # Reference: https://ai.google.dev/gemini-api/docs/models
+# Updated: 2026-03-10 - Prioritizing Gemini 3.1 Flash Lite (500 RPD)
 MODEL_MAP = {
     # Gemini 3.1 Family (Latest)
     "gemini-3.1-pro": "gemini-3.1-pro-preview",
@@ -270,32 +154,14 @@ MODEL_MAP = {
     "gemini-embedding-001": "gemini-embedding-001",
 }
 
-# Models that support image generation
-IMAGE_GENERATION_MODELS = {
-    "gemini-2.5-flash-image",
-    "gemini-3-pro-image-preview",
-    "gemini-3.1-flash-image-preview",
-}
-
-# Models available on free tier (Pro models have 0 RPD as of March 2026)
-FREE_TIER_MODELS = {
-    "gemini-3-flash-preview",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-3.1-flash-lite-preview",
-    "gemini-3-flash",
-    "gemini-3.1-flash-image-preview",
-    "gemini-2.5-flash-image",
-}
-
 # Fallback chain when all keys for a model are quota-exhausted.
-# Skips Pro models (0 RPD on free tier). Flash -> Flash only.
+# Skips Pro models (0 RPD on free tier). Flash → Flash only.
 # Only triggered when ALL keys return 429/RESOURCE_EXHAUSTED.
 MODEL_FALLBACK = {
     # Pro models fall through to Flash immediately
     "gemini-3.1-pro-preview": "gemini-3-flash-preview",
     "gemini-3-pro-preview": "gemini-3-flash-preview",
-    # Flash chain: most capable -> highest quota
+    # Flash chain: most capable → highest quota
     "gemini-3-flash-preview": "gemini-2.5-flash",
     "gemini-2.5-flash": "gemini-3.1-flash-lite-preview",
     "gemini-3.1-flash-lite-preview": None,
@@ -338,7 +204,6 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
         quality_level: Quality tier (draft, standard, production, research)
         system_prompt: System instructions for the model
         enable_tools: Enable recommended Gemini tools (google_search, code_execution)
-        capture_thinking: Capture and return the model's thinking trace
 
     Returns:
         dict with 'success', 'output', 'model_used', 'key_id', 'error', 'image_path', 'thinking_config', 'tools_used'
@@ -347,6 +212,12 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
 
     # Initialize key pool
     key_manager = KeyPoolManager()
+
+    available = key_manager.count_available("gemini")
+    if available == 0:
+        print("⚠️  No Gemini keys available — all on cooldown or reserved. Task will wait or fail.")
+    elif available < 3:
+        print(f"⚠️  Only {available} Gemini key(s) available — parallel dispatch may be limited.")
 
     # Determine task type
     is_image_generation = image_output is not None
@@ -357,6 +228,7 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
     recommended_tools = []
     task_complexity = None
 
+    model_was_explicit = model is not None
     if not model:
         routing = select_model_for_task(task, quality_level=quality_level)
         model = routing.get("model", "gemini-3-flash")
@@ -367,18 +239,25 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
         # Override for image generation tasks
         if is_image_generation:
             model = "gemini-2.5-flash-image"
-            thinking_config = None
+            thinking_config = None  # Image models don't use thinking
             recommended_tools = []
-            print(f"Image generation task, using {model}")
+            print(f"🎯 Image generation task, using {model}")
         else:
-            print(f"Auto-selected model: {model} (reason: {routing.get('rationale', 'default')})")
+            print(f"🎯 Auto-selected model: {model} (reason: {routing.get('rationale', 'default')})")
             if thinking_config:
-                print(f"Thinking config: {thinking_config}")
+                print(f"💭 Thinking config: {thinking_config}")
             if recommended_tools and enable_tools:
-                print(f"Recommended tools: {recommended_tools}")
+                print(f"🔧 Recommended tools: {recommended_tools}")
 
     # Map model name to API model name
     api_model = MODEL_MAP.get(model, model)
+
+    # Guard: embedding models don't support generateContent.
+    # Only applies when the model was auto-selected; explicit callers are trusted.
+    if not is_image_generation and not model_was_explicit and model in NON_GENERATIVE_MODELS:
+        print(f"⚠️  Auto-router selected {model} for a generative task — overriding to gemini-3-flash")
+        model = "gemini-3-flash"
+        api_model = MODEL_MAP.get(model, model)
 
     # Build content parts
     content_parts = []
@@ -390,7 +269,7 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
         with open(image_file, 'rb') as f:
             image_bytes = f.read()
         content_parts.append(genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
-        print(f"Loaded image: {image_file} ({mime_type})")
+        print(f"🖼️  Loaded image: {image_file} ({mime_type})")
 
     # Build structured prompt with context
     prompt_sections = []
@@ -418,16 +297,8 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
     full_prompt = "\n\n---\n\n".join(prompt_sections)
     content_parts.append(full_prompt)
 
-    # Build system instruction if provided or load default from config
+    # Build system instruction if provided
     effective_system_prompt = system_prompt
-    if not effective_system_prompt:
-        # Try loading default system prompt from config
-        default_prompt_path = get_root() / "config" / "system-prompt.md"
-        if default_prompt_path.exists():
-            try:
-                effective_system_prompt = default_prompt_path.read_text(encoding="utf-8").strip()
-            except Exception:
-                pass
     if not effective_system_prompt and task_complexity:
         # Fallback: generate minimal system prompt based on complexity
         complexity_prompts = {
@@ -437,8 +308,8 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
             "research": "You are a strategic advisor. Think deeply, consider multiple perspectives, and provide nuanced analysis with trade-offs."
         }
         effective_system_prompt = complexity_prompts.get(task_complexity)
-
-    # Build full fallback chain (primary -> flash -> 2.5-flash -> ...)
+    
+    # Build full fallback chain (primary → flash → 2.5-flash → ...)
     # Only traversed when ALL keys for a model are quota-exhausted.
     models_to_try = []
     _current = api_model
@@ -450,22 +321,22 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
 
     for current_model in models_to_try:
         if current_model != api_model:
-            print(f"Quota exhausted on all keys - falling back to {current_model}...")
+            print(f"🔄 Quota exhausted on all keys — falling back to {current_model}...")
 
         # Try keys until one works or we exhaust the pool
         tried_keys = set()
         attempt = 0
         consecutive_skips = 0
         consecutive_429s = 0  # Circuit breaker counter
-        quota_hit = False
-        max_consecutive_skips = 20
+        quota_hit = False  # True if any key returned a quota/rate-limit error
+        max_consecutive_skips = 20  # Prevent infinite loop if key selection keeps returning duplicates
 
         # Get total number of keys available
         try:
             provider_config = key_manager.config.get("providers", {}).get("gemini", {})
             total_keys = len(provider_config.get("keys", []))
         except Exception:
-            total_keys = 18  # Safe fallback
+            total_keys = 3  # Safe fallback
 
         # Try all keys unless explicitly capped
         effective_max_retries = max_retries if max_retries is not None else total_keys
@@ -474,25 +345,32 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
             # If we've tried all available keys, break
             if total_keys > 0 and len(tried_keys) >= total_keys:
                 break
-
-            # Select a key we haven't tried
-            key_id = key_manager.select_key("gemini")
+                
+            # Reserve a key exclusively for this attempt
+            try:
+                key_id = key_manager.reserve_key("gemini")
+            except RuntimeError:
+                # All keys are reserved or on cooldown — no point continuing this model
+                print(f"⚠️  All keys reserved or exhausted for {current_model}, moving to next model.")
+                break
             if key_id in tried_keys:
+                key_manager.release_key(key_id)
                 consecutive_skips += 1
                 if consecutive_skips >= max_consecutive_skips:
                     break
-                continue
+                continue  # Skip this iteration but don't count it as an attempt
             tried_keys.add(key_id)
-            attempt += 1
-            consecutive_skips = 0
-
+            attempt += 1  # Only increment when we actually try a key
+            consecutive_skips = 0  # Reset skip counter on successful key selection
+            
             api_key = key_manager.get_api_key(key_id)
             if not api_key:
-                print(f"Warning: Could not resolve key {key_id}")
+                print(f"⚠️  Could not resolve key {key_id}")
+                key_manager.release_key(key_id)
                 continue
-
-            print(f"Attempt {attempt}: Using key {key_id} with {current_model}")
-
+            
+            print(f"🔑 Attempt {attempt}: Using key {key_id} with {current_model}")
+            
             try:
                 client = genai.Client(api_key=api_key)
 
@@ -506,6 +384,7 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
                 # Add tools if enabled and recommended
                 tools_used = []
                 if enable_tools and recommended_tools and not is_image_generation:
+                    # Map tool names to Gemini tool objects
                     tool_mapping = {
                         "google_search": genai_types.Tool(google_search=genai_types.GoogleSearch()),
                         "code_execution": genai_types.Tool(code_execution=genai_types.ToolCodeExecution()),
@@ -525,6 +404,7 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
                 if thinking_config and not is_image_generation:
                     thinking_type = thinking_config.get("type")
                     if thinking_type == "thinking_level":
+                        # Gemini 3 models use thinking_level
                         level = thinking_config.get("level", "high")
                         config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
                             thinking_budget=-1 if level == "high" else
@@ -532,6 +412,7 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
                                            2000 if level == "low" else 0
                         )
                     elif thinking_type == "thinking_budget":
+                        # Gemini 2.5 models use thinking_budget directly
                         budget = thinking_config.get("budget", -1)
                         config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
                             thinking_budget=budget
@@ -561,7 +442,7 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
                         if image_output:
                             img_path = Path(image_output)
                             img_path.parent.mkdir(parents=True, exist_ok=True)
-
+                            
                             raw_data = part.inline_data.data
 
                             if isinstance(raw_data, bytes):
@@ -571,11 +452,11 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
                                     img_data = base64.b64decode(raw_data)
                                 except Exception as e:
                                     img_data = raw_data.encode('utf-8')
-
+                                
                             with open(img_path, 'wb') as f:
                                 f.write(img_data)
                             generated_image_path = str(img_path)
-                            print(f"Image saved to {generated_image_path}")
+                            print(f"🖼️  Image saved to {generated_image_path}")
 
                 # Fallback to response.text if no text part found
                 if output_text is None:
@@ -589,7 +470,7 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
                     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
                     with open(output_file, 'w') as f:
                         f.write(output_text)
-                    print(f"Output written to {output_file}")
+                    print(f"📄 Output written to {output_file}")
 
                 # Extract token usage from response
                 _tokens_in = None
@@ -626,7 +507,6 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
                     "image_path": generated_image_path,
                     "thinking_config": thinking_config,
                     "tools_used": tools_used,
-                    "system_prompt_used": bool(effective_system_prompt),
                     "tokens_in": _tokens_in,
                     "tokens_out": _tokens_out,
                     "duration_ms": _duration_ms,
@@ -635,6 +515,7 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
                 if _thinking_trace:
                     result["thinking_trace"] = _thinking_trace
                     result["thinking_tokens"] = _thinking_tokens
+                key_manager.release_key(key_id)
                 return result
 
             except genai_errors.ClientError as e:
@@ -644,38 +525,44 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
                     key_manager.mark_key_rate_limited(key_id, error_message=error_str)
                     limit_type = parse_rate_limit_type(error_str)
 
-                    print(f"Key {key_id} rate-limited ({limit_type}), trying next key...")
+                    print(f"⚡ Key {key_id} rate-limited ({limit_type}), trying next key...")
                     last_error = f"Rate limited: {key_id}"
                     quota_hit = True
                     consecutive_429s += 1
 
-                    # Circuit breaker: if N consecutive keys fail, likely a burst
-                    if consecutive_429s >= CIRCUIT_BREAKER_THRESHOLD:
-                        if limit_type in ("rpm", "tpm", "ipm", "unknown"):
-                            wait = COOLDOWN_TIERS["rpm"]
-                            print(f"Circuit breaker: {consecutive_429s} consecutive 429s. "
+                    # Circuit breaker — two separate thresholds for RPM vs RPD
+                    if limit_type in ("rpm", "tpm", "ipm", "unknown"):
+                        if consecutive_429s >= CIRCUIT_BREAKER_THRESHOLD_RPM:
+                            wait = COOLDOWN_TIERS["rpm"]  # 90s — RPM resets on rolling 60s window
+                            print(f"🛑 Circuit breaker (RPM): {consecutive_429s} consecutive 429s. "
                                   f"Waiting {wait}s for per-minute limits to reset...")
                             time.sleep(wait)
-                            consecutive_429s = 0
-                        else:
-                            print(f"Circuit breaker: {consecutive_429s} consecutive daily/quota 429s. "
+                            consecutive_429s = 0  # Reset after waiting
+                    elif limit_type in ("rpd", "quota"):
+                        if consecutive_429s >= CIRCUIT_BREAKER_THRESHOLD_RPD:
+                            print(f"🛑 Circuit breaker (RPD): {consecutive_429s} consecutive daily/quota 429s. "
                                   f"Falling back to next model.")
+                            key_manager.release_key(key_id)
                             break
 
                     # Small delay + jitter between retries to avoid thundering herd
                     delay = KEY_RETRY_DELAY_BASE + random.uniform(0, KEY_RETRY_DELAY_JITTER)
                     time.sleep(delay)
+                    key_manager.release_key(key_id)
                     continue
                 else:
                     last_error = error_str
-                    print(f"API error (no fallback): {error_str[:100]}")
+                    print(f"❌ API error (no fallback): {error_str[:100]}")
+                    key_manager.release_key(key_id)
                     break
             except Exception as e:
                 last_error = str(e)
-                print(f"Unexpected error (trying fallback): {last_error[:100]}")
+                print(f"❌ Unexpected error (trying fallback): {last_error[:100]}")
+                key_manager.release_key(key_id)
+                # We don't break, we allow it to try the next model if available
 
         # Proceed to next model in fallback chain
-
+    
     return {
         "success": False,
         "output": None,
@@ -685,7 +572,6 @@ def run_gemini_task(task: str, model: str = None, context_file: str = None,
         "image_path": None,
         "thinking_config": thinking_config,
         "tools_used": [],
-        "system_prompt_used": False
     }
 
 
@@ -704,7 +590,6 @@ def main():
     parser.add_argument("--system-prompt", help="System instructions for the model")
     parser.add_argument("--enable-tools", action="store_true",
                        help="Enable recommended Gemini tools (google_search, code_execution)")
-    parser.add_argument("--context-template", help="YAML context template file")
     parser.add_argument("--capture-thinking", action="store_true",
                        help="Capture and return the model's thinking trace if available")
     parser.add_argument("--json", action="store_true", help="Output result as JSON")
@@ -718,35 +603,18 @@ def main():
     elif args.image_file:
         task_type = "image understanding"
 
-    # Handle context template if provided
-    template_config = None
-    if args.context_template:
-        print(f"Loading context template: {args.context_template}")
-        template_config = parse_context_template(args.context_template)
+    task = args.task
+    model = args.model
+    quality = args.quality
+    system_prompt = args.system_prompt
+    enable_tools = args.enable_tools
 
-        task = args.task or template_config.get("task", "")
-        model = args.model or template_config.get("model", None)
-        quality = args.quality or template_config.get("quality_level", None)
-        system_prompt = args.system_prompt or template_config.get("system_prompt", None)
-        enable_tools = args.enable_tools or template_config.get("enable_tools", False)
-
-        context_content = template_config.get("context_content", "")
-        if context_content:
-            task = f"{context_content}\n\n---\n\n## Task\n\n{task}"
-            print(f"Context loaded: {len(context_content)} chars from template")
-    else:
-        task = args.task
-        model = args.model
-        quality = args.quality
-        system_prompt = args.system_prompt
-        enable_tools = args.enable_tools
-
-    print(f"Gemini Agent starting ({task_type})...")
-    print(f"Task: {task[:100]}{'...' if len(task) > 100 else ''}")
+    print(f"🤖 Gemini Agent starting ({task_type})...")
+    print(f"📝 Task: {task[:100]}{'...' if len(task) > 100 else ''}")
     if quality:
-        print(f"Quality level: {quality}")
+        print(f"📊 Quality level: {quality}")
     if enable_tools:
-        print(f"Gemini tools enabled: auto-detect from task")
+        print(f"🔧 Gemini tools enabled: auto-detect from task")
 
     result = run_gemini_task(
         task=task,
@@ -774,13 +642,13 @@ def main():
     if args.json:
         print(json.dumps(result, indent=2))
     elif result["success"]:
-        print(f"\nTask completed using {result['model_used']} (key: {result['key_id']})")
+        print(f"\n✅ Task completed using {result['model_used']} (key: {result['key_id']})")
         if result.get("image_path"):
-            print(f"Generated image: {result['image_path']}")
+            print(f"🖼️  Generated image: {result['image_path']}")
         if not args.output and not args.image_output:
             print(f"\n--- Output ---\n{result['output']}\n")
     else:
-        print(f"\nTask failed: {result['error']}")
+        print(f"\n❌ Task failed: {result['error']}")
         sys.exit(1)
 
 

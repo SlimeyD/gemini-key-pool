@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Model Router - Intelligent model selection for Gemini API key pool.
-Selects optimal Gemini model based on task complexity, type, quality requirements.
+Model Router - Intelligent model selection for multi-model orchestration
+Selects optimal model based on task complexity, type, quality requirements, and cost constraints.
 
 Loads configuration from config/model-capabilities.yaml to make routing decisions
 based on quality tiers, thinking configurations, and model capabilities.
@@ -13,7 +13,7 @@ import yaml
 from pathlib import Path
 from datetime import datetime
 
-# Import location-aware path utilities
+# Import package-aware path utilities
 try:
     from .paths import get_model_capabilities
 except ImportError:
@@ -22,7 +22,15 @@ except ImportError:
     except ImportError:
         # Fallback if paths not available (standalone use)
         def get_model_capabilities():
-            return Path(__file__).parent.parent.parent / "config" / "model-capabilities.yaml"
+            root = Path(__file__).parent.parent.parent
+            candidates = [
+                root / "config" / "model-capabilities.yaml",
+                root / "model-capabilities.yaml",
+            ]
+            for p in candidates:
+                if p.exists():
+                    return p
+            return candidates[0]
 
 # Load model capabilities configuration
 def load_model_config():
@@ -47,7 +55,7 @@ def load_model_config():
                 "draft": "gemini-3.1-flash",
                 "standard": "gemini-3-flash",
                 "production": "gemini-3-flash",
-                "research": "gemini-3-flash"
+                "research": "claude-opus-4.5"
             }
         }
     }
@@ -55,7 +63,7 @@ def load_model_config():
 CONFIG = load_model_config()
 
 # Path to the shared model performance matrix
-MATRIX_FILE = Path(__file__).parent.parent.parent / "logs" / "model_matrix.json"
+MATRIX_FILE = Path(__file__).parent.parent.parent / "memory" / "model_matrix.json"
 
 
 def check_model_matrix(task_type: str, complexity: str):
@@ -121,6 +129,11 @@ def detect_task_type(task_description):
     """Detect specialized task types that require specific models"""
     task_lower = task_description.lower()
 
+    # NOTE: Video generation (sora) and agentic coding (codex) are NOT auto-detected.
+    # These premium OpenAI models must be explicitly requested via:
+    #   openai-agent --model sora --confirm
+    #   openai-agent --model codex --confirm
+
     # Intent Analysis / Routing - Force Flash for efficiency (Strategic Reflection Guardrail)
     intent_keywords = ["intent analysis", "route task", "classify intent", "determine model", "select model", "router"]
     if any(kw in task_lower for kw in intent_keywords):
@@ -145,6 +158,16 @@ def detect_task_type(task_description):
     if any(kw in task_lower for kw in research_keywords):
         return "research_current"
 
+    # MCP tool requirements (must use Claude)
+    mcp_keywords = ["linear", "github", "supabase", "mcp", "tool use"]
+    if any(kw in task_lower for kw in mcp_keywords):
+        return "mcp_required"
+
+    # Specialized Gemini 3.1 Custom Tools detection
+    custom_tool_keywords = ["custom tools", "bash", "shell command", "terminal", "tool priority"]
+    if any(kw in task_lower for kw in custom_tool_keywords):
+        return "gemini_custom_tools"
+
     # Micro-task detection (Gemma 3)
     micro_keywords = ["fix typo", "format this", "count words", "extract single", "is this correct", "convert to json"]
     if any(kw in task_lower for kw in micro_keywords) and len(task_description) < 500:
@@ -156,19 +179,24 @@ def detect_task_type(task_description):
 def estimate_task_cost(task_description, model, model_config):
     """
     Estimate cost based on task length and model pricing.
-
+    
     Returns estimated cost in dollars.
     """
+    # Video model - estimate based on default duration
+    if "cost_per_second_720p" in model_config:
+        default_duration = 10  # Assume 10 seconds
+        return default_duration * model_config.get("cost_per_second_720p", 0.30)
+    
     # Text model - estimate tokens
     # Rough estimate: 4 characters per token
     input_tokens = len(task_description) / 4
-
+    
     # Assume 2x output tokens for most tasks
     output_tokens = input_tokens * 2
-
+    
     input_cost = (input_tokens / 1000) * model_config.get("cost_per_1k_input", 0)
     output_cost = (output_tokens / 1000) * model_config.get("cost_per_1k_output", 0)
-
+    
     return input_cost + output_cost
 
 def assess_task_complexity(task_description, metadata=None):
@@ -251,6 +279,10 @@ def get_thinking_config(model_name, quality_level):
         budget = tier_config.get("thinking_budget", thinking.get("default", -1))
         return {"type": "thinking_budget", "budget": budget}
 
+    elif thinking_type == "extended_thinking":
+        budget = tier_config.get("thinking_budget", thinking.get("default", 8000))
+        return {"type": "extended_thinking", "budget": budget}
+
     return None
 
 def select_tools_for_task(task_description):
@@ -284,8 +316,8 @@ def get_model_for_quality(quality_level, task_type="general"):
         return "gemini-3-pro-image-preview"
     if task_type == "image_generation_fast":
         return "gemini-3.1-flash-image"
-    if task_type == "embedding":
-        return "gemini-embedding-001"
+    if task_type == "mcp_required":
+        return "claude-sonnet-4.5"
 
     # Dynamic overrides for 2026 free tier (Pro models have 0 RPD on free tier)
     if quality_level == "draft":
@@ -316,7 +348,7 @@ def get_fallback_model(model_name):
 
 def select_model_for_task(task_description, metadata=None, quality_level=None):
     """
-    Select optimal Gemini model based on task characteristics and quality requirements.
+    Select optimal model based on task characteristics and quality requirements.
 
     Args:
         task_description: Description of the task
@@ -332,7 +364,9 @@ def select_model_for_task(task_description, metadata=None, quality_level=None):
     task_type = detect_task_type(task_description)
 
     # 2. Handle specialized types immediately
-
+    # NOTE: video_generation and agentic_coding are NOT handled here.
+    # OpenAI models (Codex, Sora) must be explicitly requested via openai-agent.
+    
     # Strategic Guardrail: Enforce Flash for routing/intent analysis
     if task_type == "intent_analysis":
         model = "gemini-3-flash"
@@ -347,8 +381,9 @@ def select_model_for_task(task_description, metadata=None, quality_level=None):
             "requires_confirmation": False,
             "rationale": "Strategic Guardrail: Enforced Flash for high-efficiency intent analysis"
         }
-
+    
     if task_type == "image_generation_pro":
+        # Pro image model unavailable on free tier — use Flash image
         model = "gemini-3.1-flash-image"
         return {
             "provider": "gemini",
@@ -373,10 +408,13 @@ def select_model_for_task(task_description, metadata=None, quality_level=None):
             "thinking_config": get_thinking_config(model, quality_level or "draft"),
             "tools": [],
             "requires_confirmation": False,
-            "rationale": "Fast image generation (3.1 Flash Image)"
+            "rationale": "Nano Banana 2: High-fidelity image generation with advanced text rendering (3.1 Flash Image)"
         }
 
-    if task_type == "embedding":
+    if task_type == "embedding" and quality_level is None:
+        # Only route to embedding model when no explicit quality level is given.
+        # An explicit quality_level signals a generative task that happens to
+        # contain embedding-related keywords — fall through to standard routing.
         model = "gemini-embedding-001"
         return {
             "provider": "gemini",
@@ -389,6 +427,39 @@ def select_model_for_task(task_description, metadata=None, quality_level=None):
             "tools": [],
             "requires_confirmation": False,
             "rationale": "Semantic search and clustering via embeddings"
+        }
+
+    if task_type == "mcp_required":
+        model = "claude-sonnet-4.5"
+        ql = quality_level or "standard"
+        return {
+            "provider": "claude",
+            "model": model,
+            "api_name": CONFIG.get("models", {}).get(model, {}).get("api_name", model),
+            "task_type": "mcp",
+            "complexity": assess_task_complexity(task_description, metadata),
+            "quality_level": ql,
+            "thinking_config": get_thinking_config(model, ql),
+            "tools": [],
+            "requires_confirmation": False,
+            "rationale": "MCP tools require Claude - using Sonnet for balance of quality and cost"
+        }
+
+    if task_type == "gemini_custom_tools":
+        # Pro custom tools unavailable on free tier — use best available Flash
+        model = "gemini-3-flash"
+        ql = quality_level or "production"
+        return {
+            "provider": "gemini",
+            "model": model,
+            "api_name": CONFIG.get("models", {}).get(model, {}).get("api_name", model),
+            "task_type": "agentic_tools",
+            "complexity": assess_task_complexity(task_description, metadata),
+            "quality_level": ql,
+            "thinking_config": get_thinking_config(model, ql),
+            "tools": ["code_execution"],
+            "requires_confirmation": False,
+            "rationale": "Gemini 3 Flash selected for tool tasks (Pro unavailable on free tier)"
         }
 
     if task_type == "micro_task":
@@ -427,7 +498,7 @@ def select_model_for_task(task_description, metadata=None, quality_level=None):
         provider = model_config.get("provider", "gemini")
         api_name = model_config.get("api_name", model)
         thinking_config = get_thinking_config(model, quality_level)
-        recommended_tools = select_tools_for_task(task_description)
+        recommended_tools = select_tools_for_task(task_description) if provider == "gemini" else []
         return {
             "provider": provider,
             "model": model,
@@ -458,8 +529,8 @@ def select_model_for_task(task_description, metadata=None, quality_level=None):
     # 7. Get thinking configuration
     thinking_config = get_thinking_config(model, quality_level)
 
-    # 8. Select appropriate tools
-    recommended_tools = select_tools_for_task(task_description)
+    # 8. Select appropriate tools (only for Gemini)
+    recommended_tools = select_tools_for_task(task_description) if provider == "gemini" else []
 
     # 9. Generate rationale
     rationale = _generate_rationale(model, quality_level, complexity, thinking_config)
@@ -468,7 +539,7 @@ def select_model_for_task(task_description, metadata=None, quality_level=None):
     requires_confirmation = model_config.get("requires_confirmation", False)
     estimated_cost = None
     cost_warning = None
-
+    
     if requires_confirmation:
         estimated_cost = estimate_task_cost(task_description, model, model_config)
         cost_warning = f"${estimated_cost:.2f}"
@@ -516,7 +587,7 @@ def _generate_rationale(model, quality_level, complexity, thinking_config):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(
-        description="Route tasks to optimal Gemini models based on complexity, type, and quality requirements"
+        description="Route tasks to optimal AI models based on complexity, type, and quality requirements"
     )
     parser.add_argument("--task", required=True, help="Task description")
     parser.add_argument("--quality", choices=["draft", "standard", "production", "research"],
